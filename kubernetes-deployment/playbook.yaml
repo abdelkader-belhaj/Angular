@@ -349,7 +349,11 @@
       changed_when: false
 
     - name: Save join command to local file
-      local_action: copy content="{{ join_command.stdout }}" dest=/tmp/k8s_join_command.sh
+      delegate_to: localhost
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: /tmp/k8s_join_command.sh
+        mode: '0755'
       become: no
 
 - name: Join Worker Nodes to Kubernetes Cluster

@@ -19,7 +19,7 @@ echo "⚠️  Run this on ALL nodes experiencing networking issues"
 echo ""
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
+if [ "${EUID:-0}" -ne 0 ]; then 
     echo "❌ Please run as root (use sudo)"
     exit 1
 fi

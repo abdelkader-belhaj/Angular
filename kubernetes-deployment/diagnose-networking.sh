@@ -134,7 +134,8 @@ echo ""
 # Summary
 ISSUES=0
 [ ! -d "/opt/cni/bin" ] && ISSUES=$((ISSUES+1))
-[ ! "$(ls -A /opt/cni/bin/ 2>/dev/null | wc -l)" -gt 5 ] && ISSUES=$((ISSUES+1))
+PLUGIN_COUNT=$(ls -A /opt/cni/bin/ 2>/dev/null | wc -l)
+[ "$PLUGIN_COUNT" -le 5 ] && ISSUES=$((ISSUES+1))
 ! sudo systemctl is-active --quiet containerd && ISSUES=$((ISSUES+1))
 ! sudo systemctl is-active --quiet kubelet && ISSUES=$((ISSUES+1))
 
