@@ -15,7 +15,7 @@ if [ -d "/opt/cni/bin" ]; then
     ls -la /opt/cni/bin/ 2>/dev/null | grep -E "bridge|loopback|portmap|bandwidth|firewall" | awk '{print "   - " $9 " (" $5 " bytes)"}'
     
     PLUGIN_COUNT=$(ls /opt/cni/bin/ 2>/dev/null | wc -l)
-    if [ "$PLUGIN_COUNT" -lt 5 ]; then
+    if [ "$PLUGIN_COUNT" -lt 10 ]; then
         echo "   ⚠ WARNING: Only $PLUGIN_COUNT plugins found (expected 10+)"
     fi
 else
@@ -135,7 +135,7 @@ echo ""
 ISSUES=0
 [ ! -d "/opt/cni/bin" ] && ISSUES=$((ISSUES+1))
 PLUGIN_COUNT=$(ls -A /opt/cni/bin/ 2>/dev/null | wc -l)
-[ "$PLUGIN_COUNT" -le 5 ] && ISSUES=$((ISSUES+1))
+[ "$PLUGIN_COUNT" -lt 10 ] && ISSUES=$((ISSUES+1))
 ! sudo systemctl is-active --quiet containerd && ISSUES=$((ISSUES+1))
 ! sudo systemctl is-active --quiet kubelet && ISSUES=$((ISSUES+1))
 
