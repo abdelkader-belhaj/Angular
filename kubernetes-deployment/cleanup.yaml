@@ -1,0 +1,80 @@
+---
+# Deep cleanup playbook for Kubernetes cluster nodes
+# Run this before redeploying the cluster
+
+- name: Deep cleanup of all nodes before fresh Kubernetes installation
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+    - name: Stop containerd service
+      systemd:
+        name: containerd
+        state: stopped
+      ignore_errors: yes
+
+    - name: Reset kubeadm
+      command: kubeadm reset -f
+      ignore_errors: yes
+
+    - name: Remove Kubernetes directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni/net.d
+        - /var/lib/cni
+        - /run/flannel
+        - /opt/cni/bin
+
+    - name: Remove iptables rules
+      shell: |
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+      ignore_errors: yes
+
+    - name: Remove containerd config
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Generate fresh containerd config
+      shell: containerd config default > /etc/containerd/config.toml
+      ignore_errors: yes
+
+    - name: Configure containerd to use systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      ignore_errors: yes
+
+    - name: Start containerd
+      systemd:
+        name: containerd
+        state: started
+        enabled: yes
+      ignore_errors: yes
+
+    - name: Clean up temporary files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/k8s_join_command.sh
+        - /tmp/kubernetes-apt-key.gpg
+        - /tmp/cni-plugins.tgz
+
+    - name: Display cleanup completion
+      debug:
+        msg: "✅ Node {{ inventory_hostname }} cleaned successfully"
