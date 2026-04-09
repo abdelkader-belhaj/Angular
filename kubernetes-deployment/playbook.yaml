@@ -1,0 +1,447 @@
+---
+# Kubernetes Cluster Setup with Proper CNI Configuration
+# This playbook fixes the common "ContainerCreating" issue caused by missing CNI plugins
+
+- name: Prepare all nodes for Kubernetes
+  hosts: k8s_cluster
+  become: yes
+  tasks:
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Disable swap permanently
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        line: '# \1'
+        backrefs: yes
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Ensure kernel modules load on boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Configure sysctl for Kubernetes networking
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_set: yes
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+
+    - name: Remove old containerd if installed via apt
+      apt:
+        name: containerd
+        state: absent
+        purge: yes
+      ignore_errors: yes
+
+    - name: Install prerequisites for containerd
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Create directory for Docker GPG key
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker GPG key
+      shell: |
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        chmod a+r /etc/apt/keyrings/docker.gpg
+      args:
+        creates: /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install containerd.io from Docker repo
+      apt:
+        name: containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Stop containerd
+      systemd:
+        name: containerd
+        state: stopped
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: Remove old containerd config
+      file:
+        path: /etc/containerd/config.toml
+        state: absent
+
+    - name: Generate default containerd configuration
+      shell: containerd config default > /etc/containerd/config.toml
+
+    - name: Configure containerd to use systemd cgroup driver
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Verify SystemdCgroup is set to true
+      shell: grep "SystemdCgroup = true" /etc/containerd/config.toml
+      register: systemd_cgroup_check
+      failed_when: systemd_cgroup_check.rc != 0
+      changed_when: false
+
+    # CRITICAL FIX: Install CNI plugins
+    - name: Create CNI directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/cni/bin
+        - /etc/cni/net.d
+
+    - name: Check if CNI plugins are already installed
+      stat:
+        path: /opt/cni/bin/bridge
+      register: cni_installed
+
+    - name: Download CNI plugins
+      get_url:
+        url: https://github.com/containernetworking/plugins/releases/download/v1.3.0/cni-plugins-linux-amd64-v1.3.0.tgz
+        dest: /tmp/cni-plugins.tgz
+        mode: '0644'
+      when: not cni_installed.stat.exists
+
+    - name: Extract CNI plugins
+      unarchive:
+        src: /tmp/cni-plugins.tgz
+        dest: /opt/cni/bin
+        remote_src: yes
+      when: not cni_installed.stat.exists
+
+    - name: Verify CNI plugins are installed
+      shell: ls -la /opt/cni/bin/ | grep -E "bridge|loopback|portmap"
+      register: cni_verify
+      changed_when: false
+      failed_when: cni_verify.rc != 0
+
+    - name: Restart and enable containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Wait for containerd socket to be ready
+      wait_for:
+        path: /var/run/containerd/containerd.sock
+        state: present
+        timeout: 60
+
+    - name: Test containerd with crictl
+      shell: crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock version
+      register: crictl_test
+      retries: 5
+      delay: 5
+      until: crictl_test.rc == 0
+      ignore_errors: yes
+
+    - name: Create keyrings directory for Kubernetes apt
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Kubernetes apt key
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key
+        dest: /tmp/kubernetes-apt-key.gpg
+        mode: '0644'
+
+    - name: Add Kubernetes apt key to keyring
+      shell: |
+        cat /tmp/kubernetes-apt-key.gpg | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+        state: present
+        filename: kubernetes
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubelet=1.28.2-1.1
+          - kubeadm=1.28.2-1.1
+          - kubectl=1.28.2-1.1
+        state: present
+        update_cache: yes
+        allow_downgrade: yes
+
+    - name: Hold Kubernetes packages at current version
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet service
+      systemd:
+        name: kubelet
+        enabled: yes
+
+- name: Initialize Kubernetes Master
+  hosts: masters
+  become: yes
+  tasks:
+    - name: Check if Kubernetes is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_initialized
+
+    - name: Display initialization status
+      debug:
+        msg: "Kubernetes already initialized: {{ k8s_initialized.stat.exists }}"
+
+    - name: Detect internal IP address (auto)
+      set_fact:
+        internal_ip: "{{ ansible_default_ipv4.address }}"
+
+    - name: Display network configuration
+      debug:
+        msg:
+          - "================================"
+          - "📡 Network Configuration"
+          - "================================"
+          - "SSH IP (Floating): {{ ansible_host }}"
+          - "Internal IP (Detected): {{ internal_ip }}"
+          - "Hostname: {{ ansible_hostname }}"
+          - "================================"
+
+    - name: Pull Kubernetes images before init
+      command: kubeadm config images pull
+      when: not k8s_initialized.stat.exists
+
+    - name: Initialize Kubernetes cluster
+      command: >
+        kubeadm init
+        --pod-network-cidr=10.244.0.0/16
+        --apiserver-advertise-address={{ internal_ip }}
+        --ignore-preflight-errors=NumCPU,Mem
+        --v=5
+      when: not k8s_initialized.stat.exists
+      register: kubeadm_init
+      async: 1200
+      poll: 10
+
+    - name: Wait for Kubernetes API to be ready
+      wait_for:
+        host: "{{ internal_ip }}"
+        port: 6443
+        delay: 10
+        timeout: 300
+      when: not k8s_initialized.stat.exists
+
+    - name: Create .kube directory for ubuntu user
+      file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy admin.conf to ubuntu user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Create .kube directory for root
+      file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Copy admin.conf to root user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Wait for kube-system namespace
+      shell: kubectl get namespace kube-system
+      register: kube_system_ns
+      until: kube_system_ns.rc == 0
+      retries: 30
+      delay: 10
+      become_user: ubuntu
+      when: not k8s_initialized.stat.exists
+
+    - name: Check if Flannel is already installed
+      shell: kubectl get daemonset -n kube-flannel 2>/dev/null | grep -q flannel
+      register: flannel_check
+      ignore_errors: yes
+      changed_when: false
+      become_user: ubuntu
+
+    - name: Install Flannel CNI
+      shell: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      become_user: ubuntu
+      when: flannel_check.rc != 0
+
+    - name: Wait for Flannel pods to be ready
+      shell: kubectl wait --for=condition=Ready pod -l app=flannel -n kube-flannel --timeout=300s
+      become_user: ubuntu
+      retries: 3
+      delay: 10
+      ignore_errors: yes
+      when: flannel_check.rc != 0
+
+    - name: Wait for master node to be Ready
+      shell: kubectl get nodes {{ ansible_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: node_ready
+      until: node_ready.stdout == "True"
+      retries: 60
+      delay: 10
+      become_user: ubuntu
+
+    - name: Generate join command for workers
+      command: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Save join command to local file
+      delegate_to: localhost
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: /tmp/k8s_join_command.sh
+        mode: '0755'
+      become: no
+
+- name: Join Worker Nodes to Kubernetes Cluster
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Check if node is already part of cluster
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: node_joined
+
+    - name: Copy join command to worker
+      copy:
+        src: /tmp/k8s_join_command.sh
+        dest: /tmp/k8s_join_command.sh
+        mode: '0755'
+      when: not node_joined.stat.exists
+
+    - name: Join worker to cluster
+      shell: bash /tmp/k8s_join_command.sh
+      when: not node_joined.stat.exists
+      register: join_result
+      retries: 3
+      delay: 10
+      until: join_result.rc == 0
+
+    - name: Remove join command file
+      file:
+        path: /tmp/k8s_join_command.sh
+        state: absent
+
+- name: Verify Kubernetes Cluster
+  hosts: masters
+  become: yes
+  tasks:
+    - name: Wait for all nodes to be registered
+      shell: kubectl get nodes --no-headers | wc -l
+      register: nodes_count
+      until: nodes_count.stdout|int == groups['k8s_cluster']|length
+      retries: 30
+      delay: 10
+      become_user: ubuntu
+
+    - name: Wait for all nodes to be ready
+      shell: kubectl get nodes --no-headers | grep -v "Ready" | wc -l
+      register: nodes_not_ready
+      until: nodes_not_ready.stdout == "0"
+      retries: 60
+      delay: 10
+      become_user: ubuntu
+
+    - name: Display cluster nodes
+      command: kubectl get nodes -o wide
+      become_user: ubuntu
+      register: cluster_nodes
+
+    - name: Show cluster status
+      debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+
+    - name: Display cluster components status
+      command: kubectl get pods -n kube-system -o wide
+      become_user: ubuntu
+      register: cluster_components
+
+    - name: Show cluster components
+      debug:
+        msg: "{{ cluster_components.stdout_lines }}"
+
+    - name: Display Flannel status
+      command: kubectl get pods -n kube-flannel -o wide
+      become_user: ubuntu
+      register: flannel_status
+      ignore_errors: yes
+
+    - name: Show Flannel status
+      debug:
+        msg: "{{ flannel_status.stdout_lines }}"
+      when: flannel_status.rc == 0
+
+    - name: Create verification summary
+      debug:
+        msg:
+          - "================================"
+          - "✅ Kubernetes Cluster Deployment Complete!"
+          - "================================"
+          - "SSH IP (Floating): {{ ansible_host }}"
+          - "Internal IP: {{ hostvars[inventory_hostname]['internal_ip'] | default('N/A') }}"
+          - "Total Nodes: {{ groups['k8s_cluster']|length }}"
+          - "Workers: {{ groups['workers']|length }}"
+          - "================================"
